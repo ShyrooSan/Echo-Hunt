@@ -1,0 +1,769 @@
+import pygame
+import math
+import os
+
+WIDTH, HEIGHT  = 960, 600
+HALF_H         = HEIGHT // 2
+FPS            = 60
+TILE           = 64
+
+
+FOV         = math.pi / 3
+NUM_RAYS    = WIDTH // 2
+MAX_DEPTH   = 800
+HALF_FOV    = FOV / 2
+DELTA_ANGLE = FOV / NUM_RAYS
+PROJ_DIST   = (NUM_RAYS / 2) / math.tan(HALF_FOV)
+SCALE       = WIDTH // NUM_RAYS
+
+SONAR_COOLDOWN  = 3.5
+SONAR_SPEED     = 600
+SONAR_FADE_TIME = 2.5
+MAX_SONAR_DIST  = 900
+
+MOUSE_SENSITIVITY = 0.002
+
+SONAR_CX = WIDTH - 60
+SONAR_CY = 60
+
+STATE_START    = "start"
+STATE_PLAYING  = "playing"
+STATE_WIN      = "win"
+STATE_GAMEOVER = "gameover"
+
+# 0=podea  1=perete  2=coloana  3=cheie  4=iesire
+# 5=copac (solid)  6=tufis (solid)  7=iarba (decor, nu blocheaza)
+MAP = [
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+    [1,7,0,0,7,0,1,0,0,7,0,0,0,7,0,0,0,0,7,1],
+    [1,0,1,1,0,0,1,0,1,1,1,0,1,0,1,1,1,0,0,1],
+    [1,0,1,0,0,7,0,0,0,0,1,0,1,0,0,7,1,0,0,1],
+    [1,5,1,0,1,1,1,1,0,0,1,0,0,0,1,0,0,7,0,1],
+    [1,0,0,7,1,0,0,1,0,7,1,1,1,0,1,0,1,1,0,1],
+    [1,1,1,0,1,0,2,1,7,0,0,0,1,0,1,5,1,0,0,1],
+    [1,0,7,0,1,0,0,0,0,1,0,0,1,0,0,0,1,0,7,1],
+    [1,0,1,1,1,1,1,0,0,1,6,1,1,1,1,0,1,0,0,1],
+    [1,7,0,0,0,0,1,0,7,1,0,0,0,0,1,0,0,7,0,1],
+    [1,0,1,1,0,0,1,0,1,1,1,0,1,0,1,1,1,0,0,1],
+    [1,0,1,0,2,0,7,0,0,0,1,0,1,0,0,7,0,0,3,1],
+    [1,5,0,0,1,1,1,1,0,7,1,0,0,0,1,1,1,1,0,1],
+    [1,0,7,0,0,0,0,7,0,0,0,0,7,0,0,0,0,0,4,1],
+    [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+]
+MAP_ROWS = len(MAP)
+MAP_COLS = len(MAP[0])
+
+BLACK       = (0,   0,   0)
+WHITE       = (255, 255, 255)
+CYAN        = (0,   200, 255)
+WALL_COL    = (0,   200, 255)
+OBJ_COL     = (150, 100,  60)
+KEY_COL     = (255, 215,   0)
+EXIT_COL    = (0,   255, 100)
+EXIT_LOCKED = (100,  60,  20)
+TREE_COL    = (10,  80,   15)
+BUSH_COL    = (15,  60,   10)
+
+compass_alpha = 0.0
+
+def _solid(x, y, gmap, m):
+    for cx, cy in [(x-m, y-m), (x+m, y-m), (x-m, y+m), (x+m, y+m)]:
+        c = int(cx // TILE)
+        r = int(cy // TILE)
+        if not (0 <= r < MAP_ROWS and 0 <= c < MAP_COLS):
+            return True
+        if gmap[r][c] in (1, 2, 5, 6):
+            return True
+    return False
+
+class Player:
+    def __init__(self, x, y):
+        self.x         = float(x)
+        self.y         = float(y)
+        self.angle     = 0.0
+        self.speed     = 2.0
+        self.rot_speed = 0.035
+        self.has_key   = False
+
+    def get_tile(self):
+        return int(self.y // TILE), int(self.x // TILE)
+
+    def move(self, keys, game_map):
+        if keys[pygame.K_LEFT]:  self.angle -= self.rot_speed
+        if keys[pygame.K_RIGHT]: self.angle += self.rot_speed
+
+        dx, dy = 0.0, 0.0
+        m = 12
+
+        # Strafe A/D
+        if keys[pygame.K_a]:
+            dx += math.sin(self.angle) * self.speed
+            dy -= math.cos(self.angle) * self.speed
+        if keys[pygame.K_d]:
+            dx -= math.sin(self.angle) * self.speed
+            dy += math.cos(self.angle) * self.speed
+
+        # Mers W/S
+        if keys[pygame.K_UP] or keys[pygame.K_w]:
+            dx += math.cos(self.angle) * self.speed
+            dy += math.sin(self.angle) * self.speed
+        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+            dx -= math.cos(self.angle) * self.speed
+            dy -= math.sin(self.angle) * self.speed
+
+        if not _solid(self.x + dx, self.y, game_map, m): self.x += dx
+        if not _solid(self.x, self.y + dy, game_map, m): self.y += dy
+
+    def rotate_mouse(self, dx):
+        self.angle += dx * MOUSE_SENSITIVITY
+
+
+def load_textures():
+    base  = os.path.dirname(os.path.abspath(__file__))
+    files = {
+        'wall':          'wall.png',
+        'obj':           'wall.png',
+        'exit':          'door.png',
+        'tree':          'tree.png',
+        'bush':          'bush.png',
+        'key_sprite':    'key_sprite.png',
+        'hand_key':      'hand_key.png',
+        'arrow_pointer': 'arrow_pointer.png',
+    }
+    textures = {}
+    for key, fname in files.items():
+        path = os.path.join(base, fname)
+        if os.path.exists(path):
+            try:
+                if fname.endswith('.png'):
+                    surf = pygame.image.load(path).convert_alpha()
+                else:
+                    surf = pygame.image.load(path).convert()
+                if key in ('wall', 'obj', 'exit'):
+                    surf = pygame.transform.scale(surf, (TILE, TILE))
+                textures[key] = surf
+                print(f"  OK: {fname}")
+            except Exception as e:
+                print(f"  ERR {fname}: {e}")
+                textures[key] = None
+        else:
+            print(f"  LIPSA: {fname}")
+            textures[key] = None
+    return textures
+
+
+def precompute_strips(textures):
+    strips = {}
+    for key in ('wall', 'obj', 'exit', 'tree', 'bush'):
+        surf = textures.get(key)
+        if surf is None:
+            strips[key] = None
+            continue
+        col_strips = []
+        for x in range(TILE):
+            strip = pygame.Surface((1, TILE))
+            strip.blit(surf, (0, 0), area=pygame.Rect(x, 0, 1, TILE))
+            col_strips.append(strip)
+        strips[key] = col_strips
+    return strips
+
+def cast_rays(player, game_map):
+    results   = []
+    ray_angle = player.angle - HALF_FOV
+
+    for _ in range(NUM_RAYS):
+        sin_a   = math.sin(ray_angle)
+        cos_a   = math.cos(ray_angle)
+        best_d  = float(MAX_DEPTH)
+        best_t  = 'wall'
+        best_s  = 0
+        best_tx = 0
+
+        if cos_a != 0:
+            sx = TILE if cos_a > 0 else -TILE
+            x0 = math.floor(player.x / TILE) * TILE + (TILE if cos_a > 0 else 0)
+            for _ in range(MAX_DEPTH // TILE + 2):
+                y0  = player.y + (x0 - player.x) * sin_a / cos_a
+                col = int(x0 // TILE) if cos_a > 0 else int((x0 - 1) // TILE)
+                row = int(y0 // TILE)
+                if not (0 <= row < MAP_ROWS and 0 <= col < MAP_COLS): break
+                cell = game_map[row][col]
+                if cell in (1, 2, 4, 5, 6):
+                    d = math.hypot(x0 - player.x, y0 - player.y)
+                    if d < best_d:
+                        best_d  = d
+                        best_t  = _ctype(cell)
+                        best_s  = 1
+                        best_tx = int(y0 % TILE)
+                    break
+                x0 += sx
+
+        if sin_a != 0:
+            sy = TILE if sin_a > 0 else -TILE
+            y0 = math.floor(player.y / TILE) * TILE + (TILE if sin_a > 0 else 0)
+            for _ in range(MAX_DEPTH // TILE + 2):
+                x0  = player.x + (y0 - player.y) * cos_a / sin_a
+                col = int(x0 // TILE)
+                row = int(y0 // TILE) if sin_a > 0 else int((y0 - 1) // TILE)
+                if not (0 <= row < MAP_ROWS and 0 <= col < MAP_COLS): break
+                cell = game_map[row][col]
+                if cell in (1, 2, 4, 5, 6):
+                    d = math.hypot(x0 - player.x, y0 - player.y)
+                    if d < best_d:
+                        best_d  = d
+                        best_t  = _ctype(cell)
+                        best_s  = 0
+                        best_tx = int(x0 % TILE)
+                    break
+                y0 += sy
+
+        corrected = max(best_d * math.cos(ray_angle - player.angle), 5.0)
+        wall_h    = min(int(PROJ_DIST * TILE / corrected), HEIGHT * 3)
+        results.append((wall_h, best_t, best_d, best_s, best_tx))
+        ray_angle += DELTA_ANGLE
+
+    z_buffer = [r[2] for r in results]
+    return results, z_buffer
+
+
+def _ctype(c):
+    return {2: 'obj', 3: 'key', 4: 'exit', 5: 'tree', 6: 'bush'}.get(c, 'wall')
+
+class SonarPulse:
+    def __init__(self):
+        self.front_dist = 0.0
+        self.active     = False
+        self.just_fired = False   # True doar primul frame dupa fire()
+
+    def fire(self):
+        self.front_dist = 0.0
+        self.active     = True
+        self.just_fired = True
+
+    def update(self, dt):
+        self.just_fired = False
+        if not self.active:
+            return
+        self.front_dist += SONAR_SPEED * dt
+        if self.front_dist > MAX_SONAR_DIST + SONAR_SPEED * SONAR_FADE_TIME:
+            self.active     = False
+            self.front_dist = 0.0
+
+    def alpha_for(self, world_dist):
+        if not self.active and self.front_dist <= 0:
+            return 0.0
+        if self.front_dist < world_dist:
+            return 0.0
+        time_since = (self.front_dist - world_dist) / SONAR_SPEED
+        return max(0.0, 1.0 - time_since / SONAR_FADE_TIME)
+
+
+def render_3d(surface, rays, pulse, player, strips, textures, game_map):
+    surface.fill(BLACK)
+
+    # Iarba pe podea — dungi verzi subtile pe jumatatea de jos
+    grass_alpha = pulse.alpha_for(50) * 0.4  # vizibila discret cu sonar
+    if grass_alpha > 0.01:
+        grass_col = (int(8 * grass_alpha * 4),
+                     int(30 * grass_alpha * 4),
+                     int(8 * grass_alpha * 4))
+        pygame.draw.rect(surface, grass_col, (0, HALF_H, WIDTH, HALF_H))
+
+    for i, (wall_h, hit_type, world_dist, side, tex_x) in enumerate(rays):
+        alpha = pulse.alpha_for(world_dist)
+
+        if hit_type == 'exit':
+            pass  # nu fortam alpha pentru iesire
+        elif hit_type in ('tree', 'bush'):
+            alpha = max(alpha, 0.0)
+
+        if alpha <= 0.0:
+            continue
+
+        shade      = 0.72 if side == 0 else 1.0
+        dist_f     = max(0.0, 1.0 - world_dist / MAX_DEPTH)
+        brightness = int(alpha * dist_f * shade * 255)
+        if brightness <= 0:
+            continue
+
+        col_x = i * SCALE
+        y_top = HALF_H - wall_h // 2
+
+        strip_list = strips.get(hit_type)
+        if strip_list is not None:
+            tx     = tex_x % TILE
+            raw    = strip_list[tx]
+            scaled = pygame.transform.scale(raw, (SCALE + 1, max(1, wall_h)))
+            bright_surf = pygame.Surface(scaled.get_size())
+            bright_surf.fill((brightness, brightness, brightness))
+            scaled.blit(bright_surf, (0, 0), special_flags=pygame.BLEND_MULT)
+            surface.blit(scaled, (col_x, y_top))
+        else:
+            if hit_type == 'exit':
+                base = EXIT_COL if player.has_key else EXIT_LOCKED
+            elif hit_type == 'obj':
+                base = OBJ_COL
+            elif hit_type == 'tree':
+                base = TREE_COL
+            elif hit_type == 'bush':
+                base = BUSH_COL
+            else:
+                base = WALL_COL
+            b   = brightness / 255.0
+            col = (int(base[0]*b), int(base[1]*b), int(base[2]*b))
+            pygame.draw.rect(surface, col,
+                             pygame.Rect(col_x, y_top, SCALE + 1, wall_h))
+
+
+def render_sprites(surface, player, game_map, z_buffer, pulse, textures):
+    key_pos = None
+    for row in range(MAP_ROWS):
+        for col in range(MAP_COLS):
+            if game_map[row][col] == 3:
+                key_pos = (col * TILE + TILE // 2, row * TILE + TILE // 2)
+                break
+        if key_pos:
+            break
+
+    if key_pos is None:
+        return
+
+    kx, ky = key_pos
+    dx     = kx - player.x
+    dy     = ky - player.y
+    dist   = math.hypot(dx, dy)
+    if dist < 1:
+        return
+
+    alpha = pulse.alpha_for(dist)
+    if alpha <= 0.0:
+        return
+
+    sprite_angle = math.atan2(dy, dx) - player.angle
+    while sprite_angle >  math.pi: sprite_angle -= 2 * math.pi
+    while sprite_angle < -math.pi: sprite_angle += 2 * math.pi
+
+    if abs(sprite_angle) > HALF_FOV + 0.15:
+        return
+
+    sprite_h = min(int(PROJ_DIST * TILE * 0.25 / max(dist, 1)), HEIGHT // 3)
+    sprite_w = sprite_h
+    if sprite_h < 4:
+        return
+
+    screen_x = int((sprite_angle / FOV + 0.5) * WIDTH - sprite_w // 2)
+    screen_y = HALF_H + sprite_h // 2
+
+    bright       = alpha * max(0.0, 1.0 - dist / 500)
+    pulse_glow   = 0.8 + 0.2 * math.sin(pygame.time.get_ticks() / 300.0)
+
+    tex = textures.get('key_sprite')
+
+    for col in range(sprite_w):
+        ray_idx = (screen_x + col) * NUM_RAYS // WIDTH
+        if ray_idx < 0 or ray_idx >= NUM_RAYS:
+            continue
+        if dist > z_buffer[ray_idx]:
+            continue
+
+        if tex is not None:
+            # Desenam textura cheie
+            if col == 0:
+                scaled_tex = pygame.transform.scale(tex, (sprite_w, sprite_h))
+                scaled_tex = scaled_tex.copy()
+                scaled_tex.set_alpha(int(bright * pulse_glow * 255))
+                sx = screen_x
+                sy = screen_y
+                if 0 <= sx < WIDTH:
+                    surface.blit(scaled_tex, (sx, sy))
+            break
+        else:
+            # Fallback romb auriu
+            rel_x = col / max(sprite_w, 1) - 0.5
+            for row_px in range(sprite_h):
+                rel_y  = row_px / max(sprite_h, 1) - 0.5
+                if abs(rel_x) + abs(rel_y) < 0.45:
+                    r_col = int(255 * bright * pulse_glow)
+                    g_col = int(200 * bright * pulse_glow)
+                    sx = screen_x + col
+                    sy = screen_y + row_px
+                    if 0 <= sx < WIDTH and 0 <= sy < HEIGHT:
+                        surface.set_at((sx, sy), (r_col, g_col, 0))
+
+
+# alpha_compass: 0=invizibil, 1=maxim — fade odata cu sonarul
+compass_alpha = 0.0
+
+def update_compass(pulse, player):
+    global compass_alpha
+    # Busola activa doar cand nu avem cheia
+    if player.has_key:
+        compass_alpha = 0.0
+        return
+    if pulse.active:
+        progress      = pulse.front_dist / MAX_SONAR_DIST
+        compass_alpha = max(0.0, 1.0 - progress)
+    else:
+        compass_alpha = max(0.0, compass_alpha - 0.008)
+
+
+def draw_compass(surface, font, player, game_map, pulse):
+    """Busola spre cheie — vizibila doar cat timp sonarul e activ si fara cheie."""
+    global compass_alpha
+    if compass_alpha <= 0.01 or player.has_key:
+        return
+
+    # Gasim cheia
+    target_pos = None
+    for row in range(MAP_ROWS):
+        for col in range(MAP_COLS):
+            if game_map[row][col] == 3:
+                target_pos = (col * TILE + TILE // 2,
+                              row * TILE + TILE // 2)
+                break
+        if target_pos:
+            break
+    if not target_pos:
+        return
+
+    cx, cy, radius = 60, 160, 36
+    a = int(compass_alpha * 210)
+
+    # Fundal
+    bg = pygame.Surface((radius*2+4, radius*2+4), pygame.SRCALPHA)
+    pygame.draw.circle(bg, (10, 10, 30, a),  (radius+2, radius+2), radius)
+    pygame.draw.circle(bg, (0, 80, 120, a),  (radius+2, radius+2), radius, 2)
+    surface.blit(bg, (cx - radius - 2, cy - radius - 2))
+
+    # Unghi spre cheie — FIX: atan2(dy,dx) - player.angle
+    # "inainte" in raycaster e cos(angle)/sin(angle) deci:
+    dx = target_pos[0] - player.x
+    dy = target_pos[1] - player.y
+    world_angle   = math.atan2(dy, dx)
+    rel_angle     = world_angle - player.angle   # 0 = exact in fata
+
+    # Varful acului: sus = inainte, dreapta = dreapta
+    needle_len = radius - 6
+    tip_x  = cx + int(math.sin(rel_angle) * needle_len)
+    tip_y  = cy - int(math.cos(rel_angle) * needle_len)
+    tail_x = cx - int(math.sin(rel_angle) * (needle_len // 2))
+    tail_y = cy + int(math.cos(rel_angle) * (needle_len // 2))
+
+    ns = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    rc, gc, bc = (255, 215, 0)
+    pygame.draw.line(ns, (rc, gc, bc, a), (tail_x, tail_y), (tip_x, tip_y), 3)
+
+    # Triunghi varf
+    pa = rel_angle + math.pi / 2
+    p1 = (tip_x, tip_y)
+    p2 = (tip_x - int(math.sin(pa)*5) - int(math.sin(rel_angle)*8),
+          tip_y + int(math.cos(pa)*5) - int(math.cos(rel_angle)*8))
+    p3 = (tip_x + int(math.sin(pa)*5) - int(math.sin(rel_angle)*8),
+          tip_y - int(math.cos(pa)*5) - int(math.cos(rel_angle)*8))
+    pygame.draw.polygon(ns, (rc, gc, bc, a), [p1, p2, p3])
+    pygame.draw.circle(ns, (200, 200, 200, a), (cx, cy), 3)
+    surface.blit(ns, (0, 0))
+
+    lbl = font.render("CHEIE", True, (255, 215, 0))
+    lbl.set_alpha(a)
+    surface.blit(lbl, (cx - lbl.get_width()//2, cy + radius + 6))
+
+
+def draw_hot_cold(surface, font_med, player, game_map):
+    """Indicator cald/rece spre usa — activ doar dupa ce ai cheia."""
+    if not player.has_key:
+        return
+
+    # Gasim usa
+    exit_pos = None
+    for row in range(MAP_ROWS):
+        for col in range(MAP_COLS):
+            if game_map[row][col] == 4:
+                exit_pos = (col * TILE + TILE // 2,
+                            row * TILE + TILE // 2)
+                break
+        if exit_pos:
+            break
+    if not exit_pos:
+        return
+
+    dist = math.hypot(exit_pos[0] - player.x, exit_pos[1] - player.y)
+    max_dist = math.hypot(MAP_COLS * TILE, MAP_ROWS * TILE)
+
+    # 0.0 = foarte aproape (cald), 1.0 = foarte departe (rece)
+    t = min(1.0, dist / (max_dist * 0.6))
+
+    if t < 0.25:
+        msg     = "FOARTE CALD!!"
+        r, g, b = 255, 60,  0
+    elif t < 0.5:
+        msg     = "CALD"
+        r, g, b = 255, 160, 0
+    elif t < 0.75:
+        msg     = "RECE"
+        r, g, b = 80,  160, 255
+    else:
+        msg     = "FOARTE RECE..."
+        r, g, b = 20,  80,  255
+
+    # Pulsatie
+    pulse_v = 0.75 + 0.25 * math.sin(pygame.time.get_ticks() / 300.0)
+    col     = (int(r*pulse_v), int(g*pulse_v), int(b*pulse_v))
+
+    txt = font_med.render(msg, True, col)
+    surface.blit(txt, (20, HEIGHT - 60))
+
+
+def draw_hud(surface, font, player, sonar_cd, pulse, textures):
+    ready   = sonar_cd <= 0
+    cd_r    = max(0.0, 1.0 - sonar_cd / SONAR_COOLDOWN)
+    bar_col = (0, 200, 255) if ready else (0, 100, 140)
+    cx, cy  = SONAR_CX, SONAR_CY
+
+    # Cerc indicator sonar
+    pygame.draw.circle(surface, (20, 20, 40),  (cx, cy), 45)
+    pygame.draw.circle(surface, (0,  80, 120), (cx, cy), 45, 1)
+    if pulse.active:
+        r = int(44 * min(pulse.front_dist / MAX_SONAR_DIST, 1.0))
+        if r > 0:
+            pygame.draw.circle(surface, CYAN, (cx, cy), r, 2)
+
+    bar_x = cx - 40
+    bar_y = cy + 52
+    pygame.draw.rect(surface, (25, 25, 25), (bar_x, bar_y, 80, 10))
+    pygame.draw.rect(surface, bar_col,      (bar_x, bar_y, int(80 * cd_r), 10))
+    pygame.draw.rect(surface, WHITE,        (bar_x, bar_y, 80, 10), 1)
+    lbl = font.render("SPACE" + (" GATA!" if ready else "..."), True, WHITE)
+    surface.blit(lbl, (cx - lbl.get_width() // 2, bar_y + 14))
+
+    # Cheie in mana sau indicator
+    if player.has_key:
+        tex = textures.get('hand_key')
+        if tex:
+            hk = pygame.transform.scale(tex, (180, 135))
+            surface.blit(hk, (WIDTH - 190, HEIGHT - 145))
+    else:
+        ktx = font.render("CHEIE: NU", True, (100, 100, 100))
+        surface.blit(ktx, (20, HEIGHT - 36))
+
+
+def draw_start_screen(surface, font_big, font, font_med, t):
+    surface.fill(BLACK)
+    pv    = 0.7 + 0.3 * math.sin(t * 2.0)
+    title = font_big.render("ECHO HUNT", True, (0, int(200*pv), int(255*pv)))
+    surface.blit(title, (WIDTH//2 - title.get_width()//2, 100))
+    sub = font_med.render("Esti orbit. Singurul tau instrument: sonarul.",
+                          True, (150, 150, 180))
+    surface.blit(sub, (WIDTH//2 - sub.get_width()//2, 185))
+    rows = [
+        ("W / S",          "Mergi inainte / inapoi"),
+        ("A / D",          "Deplasare laterala"),
+        ("Mouse / Sageti", "Roteste-te"),
+        ("SPACE",          "Trimite puls sonar  (cooldown 4s)"),
+        ("",               ""),
+        ("Obiectiv:",      "Gaseste CHEIA, apoi IESIREA"),
+    ]
+    y = 250
+    for k, d in rows:
+        if k == "":
+            y += 10; continue
+        surface.blit(font.render(k, True, CYAN),            (WIDTH//2 - 260, y))
+        surface.blit(font.render(d, True, (200, 200, 200)), (WIDTH//2 - 60,  y))
+        y += 30
+    if int(t * 2) % 2 == 0:
+        e = font_med.render("Apasa  ENTER  pentru a incepe", True, WHITE)
+        surface.blit(e, (WIDTH//2 - e.get_width()//2, HEIGHT - 90))
+
+
+def draw_win_screen(surface, font_big, font_med, font, t):
+    surface.fill(BLACK)
+    for y in range(0, HEIGHT, 6):
+        a = int(30 + 20 * math.sin(y * 0.1 + t))
+        pygame.draw.line(surface, (0, a, 0), (0, y), (WIDTH, y))
+    pv    = 0.8 + 0.2 * math.sin(t * 3.0)
+    title = font_big.render("AI SCAPAT!", True, (0, int(255*pv), int(100*pv)))
+    surface.blit(title, (WIDTH//2 - title.get_width()//2, 160))
+    msg = font_med.render("Ai navigat prin intuneric si ai gasit iesirea.",
+                          True, (180, 255, 180))
+    surface.blit(msg, (WIDTH//2 - msg.get_width()//2, 270))
+    if int(t * 2) % 2 == 0:
+        r = font.render("R = joaca din nou   |   ESC = iesi", True, (150, 150, 150))
+        surface.blit(r, (WIDTH//2 - r.get_width()//2, HEIGHT - 80))
+
+
+def draw_gameover_screen(surface, font_big, font_med, font, t):
+    surface.fill(BLACK)
+    pv    = 0.6 + 0.4 * abs(math.sin(t * 1.5))
+    title = font_big.render("GAME OVER", True, (int(220*pv), int(40*pv), int(40*pv)))
+    surface.blit(title, (WIDTH//2 - title.get_width()//2, 160))
+    msg = font_med.render("Intunericul te-a invins.", True, (200, 100, 100))
+    surface.blit(msg, (WIDTH//2 - msg.get_width()//2, 270))
+    if int(t * 2) % 2 == 0:
+        r = font.render("R = incearca din nou   |   ESC = iesi", True, (150, 150, 150))
+        surface.blit(r, (WIDTH//2 - r.get_width()//2, HEIGHT - 80))
+
+
+def check_interactions(player, game_map):
+    row, col = player.get_tile()
+    tile = game_map[row][col]
+    if tile == 3 and not player.has_key:
+        player.has_key     = True
+        game_map[row][col] = 0
+        return "key"
+    if tile == 4 and player.has_key:
+        return "win"
+    return None
+
+def load_sounds():
+    base   = os.path.dirname(os.path.abspath(__file__))
+    sounds = {}
+    files  = {
+        'sonar': 'sound_sonar.wav',
+        'key':   'sound_key.wav',
+        'win':   'sound_win.wav',
+        'lose':  'sound_lose.wav',
+        'door':  'sound_door.wav',
+    }
+    for name, fname in files.items():
+        path = os.path.join(base, fname)
+        if os.path.exists(path):
+            try:
+                sounds[name] = pygame.mixer.Sound(path)
+                print(f"  OK sunet: {fname}")
+            except Exception as e:
+                print(f"  ERR sunet {fname}: {e}")
+                sounds[name] = None
+        else:
+            print(f"  LIPSA sunet: {fname}")
+            sounds[name] = None
+    return sounds
+
+
+def play(sounds, name):
+    s = sounds.get(name)
+    if s:
+        s.play()
+def reset_game():
+    global compass_alpha
+    compass_alpha = 0.0
+    return Player(1.5 * TILE, 1.5 * TILE), [row[:] for row in MAP], SonarPulse()
+
+
+def main():
+    pygame.init()
+    pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+
+    screen   = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Echo Hunt")
+    clock    = pygame.time.Clock()
+    font     = pygame.font.SysFont("consolas", 16)
+    font_med = pygame.font.SysFont("consolas", 22)
+    font_big = pygame.font.SysFont("consolas", 52, bold=True)
+
+    print("Se incarca texturile...")
+    textures = load_textures()
+    print("Se pre-calculeaza fasiile...")
+    strips   = precompute_strips(textures)
+    print("Se incarca sunetele...")
+    sounds   = load_sounds()
+    print("Gata!")
+
+    player, game_map, pulse = reset_game()
+    sonar_cd       = 0.0
+    state          = STATE_START
+    t              = 0.0
+    mouse_captured = False
+
+    while True:
+        dt = clock.tick(FPS) / 1000.0
+        t += dt
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); return
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    if state == STATE_PLAYING:
+                        pygame.mouse.set_visible(True)
+                        pygame.event.set_grab(False)
+                        mouse_captured = False
+                        state = STATE_GAMEOVER
+                        play(sounds, 'lose')
+                    else:
+                        pygame.quit(); return
+
+                if event.key == pygame.K_RETURN and state == STATE_START:
+                    player, game_map, pulse = reset_game()
+                    sonar_cd = 0.0
+                    state    = STATE_PLAYING
+                    pygame.mouse.set_visible(False)
+                    pygame.event.set_grab(True)
+                    mouse_captured = True
+
+                if event.key == pygame.K_r and state in (STATE_WIN, STATE_GAMEOVER):
+                    player, game_map, pulse = reset_game()
+                    sonar_cd = 0.0
+                    state    = STATE_PLAYING
+                    t        = 0.0
+                    pygame.mouse.set_visible(False)
+                    pygame.event.set_grab(True)
+                    mouse_captured = True
+                    pygame.mixer.stop()
+
+                if event.key == pygame.K_SPACE and state == STATE_PLAYING and sonar_cd <= 0:
+                    pulse.fire()
+                    sonar_cd = SONAR_COOLDOWN
+                    play(sounds, 'sonar')
+
+            if event.type == pygame.MOUSEMOTION and mouse_captured and state == STATE_PLAYING:
+                mouse_dx, _ = event.rel
+                player.rotate_mouse(mouse_dx)
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if state == STATE_PLAYING and not mouse_captured:
+                    pygame.mouse.set_visible(False)
+                    pygame.event.set_grab(True)
+                    mouse_captured = True
+
+        if state == STATE_PLAYING:
+            keys = pygame.key.get_pressed()
+            player.move(keys, game_map)
+
+            rays, z_buffer = cast_rays(player, game_map)
+
+            pulse.update(dt)
+            sonar_cd = max(0.0, sonar_cd - dt)
+            update_compass(pulse, player)
+
+            result = check_interactions(player, game_map)
+            if result == "key":
+                play(sounds, 'key')
+            elif result == "win":
+                state = STATE_WIN
+                t     = 0.0
+                pygame.mouse.set_visible(True)
+                pygame.event.set_grab(False)
+                mouse_captured = False
+                play(sounds, 'door')
+                pygame.time.delay(600)
+                play(sounds, 'win')
+
+            render_3d(screen, rays, pulse, player, strips, textures, game_map)
+            render_sprites(screen, player, game_map, z_buffer, pulse, textures)
+            draw_hud(screen, font, player, sonar_cd, pulse, textures)
+            draw_compass(screen, font, player, game_map, pulse)
+            draw_hot_cold(screen, font_med, player, game_map)
+
+        elif state == STATE_START:
+            draw_start_screen(screen, font_big, font, font_med, t)
+        elif state == STATE_WIN:
+            draw_win_screen(screen, font_big, font_med, font, t)
+        elif state == STATE_GAMEOVER:
+            draw_gameover_screen(screen, font_big, font_med, font, t)
+
+        pygame.display.flip()
+
+
+if __name__ == "__main__":
+    main()
